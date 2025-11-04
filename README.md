@@ -33,7 +33,7 @@ pip install -r requirements.txt
 
 Go to `scripts` and run:
 ```bash
-streamlit run  ruland-plots_streamlit.py --server.address localhost --server.port 8060 --browser.gatherUsageStats False
+streamlit run  ruland-plots_streamlit.py --server.address localhost --server.port 8065 --browser.gatherUsageStats False
 ```
 ## How to cite
 
