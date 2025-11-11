@@ -187,61 +187,68 @@ def hidden_phrase_embedding(
         vec = span.mean(dim=0)
     return vec.cpu().numpy()
 
-def embed_instance(
-    row,
+def embed_emlap_instance(
+    instance: dict,
     tokenizer,
     model,
     *,
-    device="cpu",
-    layer_idx=11,
-    piece_pooling="mean",
-    context_lemmatized=True,
-    target_lemmatized=False,
-    context_pos_filtered=True,
+    device: str = "cpu",
+    layer_idx: int = 11,
+    piece_pooling: str = "mean",
+    context_lemmatized: bool = True,
+    target_lemmatized: bool = False,
+    context_pos_filtered: bool = True,
     pos_keep=("NOUN", "ADJ", "VERB", "PROPN"),
 ):
     """
-    Builds a contextual embedding for one KWIC instance (possibly multiword target phrase).
+    Build a contextual embedding for one EMLAP KWIC instance dict.
 
     Parameters
     ----------
-    row : pd.Series or dict
-        Must include 'kwic_tokens' (list of dicts) and 'target_kwic_idx' (list of ints).
-    tokenizer : HuggingFace tokenizer or compatible
-        Tokenizer used for Latin BERT.
-    model : HuggingFace model
-        Pretrained transformer model.
-    device : str
-        Device string ('cpu' or 'cuda').
-    layer_idx : int
-        Which hidden layer to use for embedding extraction.
-    piece_pooling : str
-        How to pool subword pieces ('mean', 'sum', or 'max').
-    context_lemmatized : bool
-        If True, use lemmas for context tokens; else use surface forms.
-    target_lemmatized : bool
-        If True, use lemmas for target tokens; else use surface forms.
-    context_pos_filtered : bool
-        If True, include only tokens with POS in pos_keep in context.
-    pos_keep : tuple[str]
-        POS tags to include when filtering context tokens.
+    instance : dict
+        EMLAP instance as produced by your query (see example in the message).
+        Must include:
+          - 'kwic_tokens'        : array/list[dict]
+          - 'target_kwic_idx'    : array/list[int]
+          - 'grela_id'           : str
+          - 'target_sentence_id' : str
+        Optionally:
+          - 'target_sentence_text': str
+
+    tokenizer : HuggingFace tokenizer (or compatible)
+    model     : HuggingFace model
+    device    : 'cpu' or 'cuda'
+    layer_idx : which hidden layer to read
+    piece_pooling : 'mean' | 'sum' | 'max'
+    context_lemmatized : if True, use lemmas for context; else surface forms
+    target_lemmatized  : if True, use lemmas for target; else surface forms
+    context_pos_filtered : if True, filter context to POS in pos_keep
+    pos_keep : POS tags to keep when filtering context
 
     Returns
     -------
     dict with standardized keys:
-      - "embedding"        : np.ndarray  (vector representation of target phrase)
-      - "target_terms"     : list[str]
-      - "context_left"     : list[str]
-      - "context_right"    : list[str]
-      - "target_tokens"    : list[dict]
-      - "grela_id"         : str
+      - "embedding"         : np.ndarray (vector for target phrase)
+      - "target_terms"      : list[str]
+      - "context_left"      : list[str]
+      - "context_right"     : list[str]
+      - "target_tokens"     : list[dict]
+      - "grela_id"          : str
       - "target_sentence_id": str
-      - "sentence_text"    : str
-      - "span_subwords"    : tuple[int, int]  (subword start/end span)
+      - "sentence_text"     : str | None
+      - "span_subwords"     : tuple[int, int] | None
     """
 
-    kwic_tokens = row["kwic_tokens"]
-    target_idx = row["target_kwic_idx"]
+    # --- Pull pieces from the EMLAP instance, handling numpy arrays gracefully ---
+    kwic_tokens = instance.get("kwic_tokens", [])
+    if hasattr(kwic_tokens, "tolist"):
+        kwic_tokens = kwic_tokens.tolist()
+    kwic_tokens = list(kwic_tokens)  # ensure python list[dict]
+
+    target_idx = instance.get("target_kwic_idx", [])
+    if hasattr(target_idx, "tolist"):
+        target_idx = target_idx.tolist()
+    target_idx = [int(i) for i in target_idx]
 
     # --- (1) Context split with configurable lemmatization/POS filtering ---
     ctx_data = process_kwic_tokens(
@@ -253,7 +260,7 @@ def embed_instance(
         pos_keep=pos_keep,
     )
 
-    # --- (2) Subword augmentation (target span) ---
+    # --- (2) Subword augmentation (target span over surface tokens) ---
     sent_str, sp_toks, aug_toks, span = augment_with_subwords_span(
         kwic_tokens,
         target_idx,
@@ -271,15 +278,15 @@ def embed_instance(
         piece_pooling=piece_pooling,
     )
 
-    # --- (4) Collect outputs ---
+    # --- (4) Collect outputs (standardized keys) ---
     return {
         "embedding": vec,
         "target_terms": ctx_data["target_terms"],
         "context_left": ctx_data["context_left"],
         "context_right": ctx_data["context_right"],
         "target_tokens": ctx_data["target_tokens"],
-        "grela_id": row.get("grela_id"),
-        "target_sentence_id": row.get("target_sentence_id"),
-        "sentence_text": row.get("target_sentence_text"),
+        "grela_id": instance.get("grela_id"),
+        "target_sentence_id": instance.get("target_sentence_id"),
+        "sentence_text": instance.get("target_sentence_text"),
         "span_subwords": span,
     }
