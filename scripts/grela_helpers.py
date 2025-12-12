@@ -3,17 +3,19 @@
 import re
 from typing import Optional
 import duckdb
-import unicodedata
 
-# --- connection + setup helpers -----------------------------------------
+
+# ---------------------------------------------------------------------------
+# Connection helper
+# ---------------------------------------------------------------------------
 
 def make_connection(
-    db_path: str = "/srv/data/grela/grela_v0.6.duckdb",
+    db_path: str = "/srv/data/grela/grela_v0.7.duckdb",
     read_only: bool = True,
 ) -> duckdb.DuckDBPyConnection:
     """
     Create and configure a DuckDB connection for GreLa.
-    Does NOT create temp streams or indexes yet.
+    No temp tables are created here; everything works directly on `tokens`.
     """
     conn = duckdb.connect(db_path, read_only=read_only)
     conn.execute("""
@@ -26,273 +28,493 @@ def make_connection(
     return conn
 
 
-def init_grela_streams(conn: duckdb.DuckDBPyConnection) -> None:
+# ---------------------------------------------------------------------------
+# Helpers for target normalization
+# ---------------------------------------------------------------------------
+
+def _norm(s: Optional[str]) -> Optional[str]:
     """
-    Create grela_full_stream, grela_content_stream and hot indexes.
-    Call this ONCE per connection before using concordance().
-    Safe to call multiple times (it just replaces temp tables).
+    Light normalization: lowercase + collapse whitespace.
+    (No diacritics / j→i / v→u; your DB is already normalized.)
     """
-    conn.execute("""
-    CREATE OR REPLACE TEMP TABLE grela_full_stream AS
-    SELECT
-      t.grela_id,
-      t.sentence_id,
-      s.position AS sentence_position,
-      t.token_id,
-      t.token_text,
-      LOWER(t.token_text) AS token_text_lower,
-      LOWER(t.lemma)      AS lemma_lower,
-      t.pos,
-      t.ref,
-      t.char_start,
-      t.char_end,
-      ROW_NUMBER() OVER (
-        PARTITION BY t.grela_id
-        ORDER BY s.position, t.char_start
-      ) AS seq_full
-    FROM tokens t
-    JOIN works w  ON t.grela_id = w.grela_id
-    JOIN sentences s USING (sentence_id);
-    """)
-
-    conn.execute("""
-    CREATE OR REPLACE TEMP TABLE grela_content_stream AS
-    WITH c AS (
-      SELECT
-        f.*,
-        ROW_NUMBER() OVER (
-          PARTITION BY f.grela_id
-          ORDER BY f.sentence_position, f.char_start
-        ) AS seq_content
-      FROM grela_full_stream f
-      WHERE f.lemma_lower IS NOT NULL
-        AND f.pos <> 'PUNCT'
-    )
-    SELECT
-      c.*,
-      LEAD(c.lemma_lower, 1) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) AS l2,
-      LEAD(c.lemma_lower, 2) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) AS l3,
-      LEAD(c.seq_full,     1) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) AS next1_seq_full,
-      LEAD(c.seq_full,     2) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) AS next2_seq_full,
-      CASE WHEN LEAD(c.lemma_lower,1) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) IS NOT NULL
-           THEN c.lemma_lower || ' ' || LEAD(c.lemma_lower,1) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content)
-      END AS n2,
-      CASE WHEN LEAD(c.lemma_lower,2) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) IS NOT NULL
-           THEN c.lemma_lower || ' ' || LEAD(c.lemma_lower,1) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content) || ' ' ||
-                LEAD(c.lemma_lower,2) OVER (PARTITION BY c.grela_id ORDER BY c.seq_content)
-      END AS n3
-    FROM c;
-    """)
-
-    # indexes on temp tables – created once per connection
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_grela_content_lemma ON grela_content_stream(lemma_lower);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_grela_content_n2    ON grela_content_stream(n2);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_grela_content_n3    ON grela_content_stream(n3);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_grela_full_token    ON grela_full_stream(token_text_lower);")
+    if not s or not isinstance(s, str):
+        return None
+    s = re.sub(r"\s+", " ", s.strip().lower())
+    return s or None
 
 
-# --- your concordance function (unchanged logic) ------------------------
-# paste your existing concordance_for_target_across_sentences here,
-# but DROP the top-level `conn = ...` and temp-table creation;
-# it should just assume grela_* tables already exist in the conn.
-#
-# def concordance_for_target_across_sentences(conn, ...):
-#     ...
+def _prep(t: Optional[str]):
+    """
+    Prepare 1–3 word target:
+      returns (length, (w1,w2,w3), "joined phrase")
+    Raises if >3 words.
+    """
+    if not t:
+        return 0, ("", "", ""), ""
+    words = t.split()
+    if not (1 <= len(words) <= 3):
+        raise ValueError("Only 1–3-word targets supported (MAX_N=3).")
+    w = tuple(words + ["", "", ""])[:3]
+    return len(words), w, " ".join(words)
 
 
-def concordance_for_target_across_sentences(
-    conn,
-    target_canonical: str | None,
-    target_relemmatized: str | None,
-    window: int = 10,
-    include_tokens: bool = True,
-    max_hits: Optional[int] = None,
-    out_path: Optional[str] = None,
+# ---------------------------------------------------------------------------
+# Phase 1: find token spans (only IDs)
+# ---------------------------------------------------------------------------
+
+def create_target_spans_table(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str = "temp_target_spans",
+    target_canonical: Optional[str] = None,
+    target_relemmatized: Optional[str] = None,
     emlap_only: bool = True,
-    heavy_normalization: Optional[bool] = None,  # NEW
-):
+    max_hits: Optional[int] = None,
+) -> None:
     """
-    Cross-sentence KWIC in GreLa with strict adjacency, searching BOTH lemma and token_text
-    for BOTH target_canonical and target_relemmatized.
+    Phase 1: find target spans ONLY and materialize them as a TEMP TABLE in DuckDB.
 
-    heavy_normalization:
-      - True  = full Latin normalization (diacritics, æ/œ, j→i, v→u).
-      - False = cheap: lowercase + trim (fastest).
-      - None  = default: True for emlap_only, False for whole GreLa.
+    The resulting table has schema:
+
+      table_name(
+        span_idx           BIGINT,  -- 1,2,3,... for chunked processing
+        grela_id           TEXT,
+        target_sentence_id TEXT,
+        start_token_id     BIGINT,
+        end_token_id       BIGINT,
+        matched_by         TEXT,    -- 'lemma' | 'token'
+        target_from        TEXT,    -- 'canonical' | 'relemmatized'
+        target_phrase      TEXT
+      )
+
+    Matching behaviour:
+      - lemma_or_token := lower(COALESCE(NULLIF(lemma,''), token_text))
+      - token_text_lower := lower(token_text)
+      - 1–3-word collocations, strict adjacency via token_id+1/+2.
+      - de-duplicates on (grela_id, sentence_id, start_token_id), preferring
+        lemma > token, canonical > relemmatized (same as your previous logic).
     """
 
-    # ---------- decide normalization profile ----------
-    if heavy_normalization is None:
-        # Heuristic: keep the rich normalization for EMLAP-only,
-        # but default to fast mode on the full GreLa
-        heavy_normalization = emlap_only
-
-    # ---------- Normalization helpers (Python side) ----------
-    def _strip_diacritics(s: str) -> str:
-        return "".join(
-            ch for ch in unicodedata.normalize("NFKD", s)
-            if not unicodedata.combining(ch)
-        )
-
-    def _latin_norm_heavy(s: str | None) -> str | None:
-        if not s or not isinstance(s, str):
-            return None
-        s = s.strip().lower()
-        s = _strip_diacritics(s)
-        s = (s.replace("æ", "ae").replace("œ", "oe")
-               .replace("j", "i").replace("v", "u"))
-        s = s.replace("_", " ")
-        s = re.sub(r"\s+", " ", s).strip()
-        return s or None
-
-    def _latin_norm_light(s: str | None) -> str | None:
-        if not s or not isinstance(s, str):
-            return None
-        s = re.sub(r"\s+", " ", s.strip().lower())
-        return s or None
-
-    NORM_PY = _latin_norm_heavy if heavy_normalization else _latin_norm_light
-
-    def _prep(t: str | None):
-        if not t:
-            return 0, ("", "", ""), ""
-        words = t.split()
-        if not (1 <= len(words) <= 3):
-            raise ValueError("Only 1–3-word targets supported (MAX_N=3).")
-        w = tuple(words + ["", "", ""])[:3]
-        return len(words), w, " ".join(words)
-
-    tc = NORM_PY(target_canonical)
-    tr = NORM_PY(target_relemmatized)
+    tc = _norm(target_canonical)
+    tr = _norm(target_relemmatized)
     if not tc and not tr:
         raise ValueError("Provide at least one of target_canonical or target_relemmatized.")
 
     tc_len, (tc_w1, tc_w2, tc_w3), tc_phrase = _prep(tc)
     tr_len, (tr_w1, tr_w2, tr_w3), tr_phrase = _prep(tr)
 
-    # ---------- SQL-side normalizer ----------
-    def NORM_SQL(expr: str) -> str:
-        if heavy_normalization:
-            # original rich normalization (slower)
-            return (
-                "replace(replace(replace(replace(lower({x}), 'æ', 'ae'), "
-                "'œ', 'oe'), 'j', 'i'), 'v', 'u')"
-            ).format(x=expr)
-        else:
-            # fast: just lower-case
-            return f"lower({expr})"
+    corpus_pred = "w.grela_id LIKE 'emlap%'" if emlap_only else "TRUE"
 
-    # lemma expression is just lemma_lower (we know it's NOT NULL in content stream)
-    LEMMA_NORM = NORM_SQL("cs.lemma_lower")
+    raw_selects: list[str] = []
+    params: list = []
 
-    # ---------- Corpus predicate ----------
-    corpus_pred = "grela_id LIKE 'emlap%'" if emlap_only else "TRUE"
+    def add_select(sql_part: str, *p):
+        raw_selects.append(sql_part)
+        params.extend(p)
 
-    # ---------- SQL core ----------
-    sql_core = f"""
-WITH base_full AS (
-  SELECT *
-  FROM grela_full_stream
-  WHERE {corpus_pred}
-),
-base_content AS (
-  SELECT *
-  FROM grela_content_stream
-  WHERE {corpus_pred}
-),
-raw_matches AS (
-  -- 1) lemma matches: canonical
-  SELECT cs.grela_id, cs.sentence_id AS target_sentence_id, cs.seq_full AS start_seq_full,
-         ?::INT AS target_len, 'lemma' AS matched_by, 'canonical' AS target_from, ?::VARCHAR AS target_phrase
-  FROM base_content cs
-  WHERE ? AND (
-    (? = 1 AND {LEMMA_NORM} = ?)
-    OR (? = 2 AND {NORM_SQL('cs.n2')} = ?)
-    OR (? = 3 AND {NORM_SQL('cs.n3')} = ?)
-  )
+    # ---- 1) lemma-or-token canonical ----
+    if tc:
+        if tc_len == 1:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t1.token_id    AS end_token_id,
+      'lemma'        AS matched_by,
+      'canonical'    AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(coalesce(nullif(t1.lemma, ''), t1.token_text)) = ?
+                """,
+                tc_phrase, tc_w1,
+            )
+        elif tc_len == 2:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t2.token_id    AS end_token_id,
+      'lemma'        AS matched_by,
+      'canonical'    AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(coalesce(nullif(t1.lemma, ''), t1.token_text)) = ?
+      AND lower(coalesce(nullif(t2.lemma, ''), t2.token_text)) = ?
+                """,
+                tc_phrase, tc_w1, tc_w2,
+            )
+        elif tc_len == 3:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t3.token_id    AS end_token_id,
+      'lemma'        AS matched_by,
+      'canonical'    AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN tokens t3
+      ON t3.grela_id = t1.grela_id
+     AND t3.token_id = t1.token_id + 2
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(coalesce(nullif(t1.lemma, ''), t1.token_text)) = ?
+      AND lower(coalesce(nullif(t2.lemma, ''), t2.token_text)) = ?
+      AND lower(coalesce(nullif(t3.lemma, ''), t3.token_text)) = ?
+                """,
+                tc_phrase, tc_w1, tc_w2, tc_w3,
+            )
 
-  UNION ALL
+    # ---- 2) lemma-or-token relemmatized ----
+    if tr:
+        if tr_len == 1:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t1.token_id    AS end_token_id,
+      'lemma'        AS matched_by,
+      'relemmatized' AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(coalesce(nullif(t1.lemma, ''), t1.token_text)) = ?
+                """,
+                tr_phrase, tr_w1,
+            )
+        elif tr_len == 2:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t2.token_id    AS end_token_id,
+      'lemma'        AS matched_by,
+      'relemmatized' AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(coalesce(nullif(t1.lemma, ''), t1.token_text)) = ?
+      AND lower(coalesce(nullif(t2.lemma, ''), t2.token_text)) = ?
+                """,
+                tr_phrase, tr_w1, tr_w2,
+            )
+        elif tr_len == 3:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t3.token_id    AS end_token_id,
+      'lemma'        AS matched_by,
+      'relemmatized' AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN tokens t3
+      ON t3.grela_id = t1.grela_id
+     AND t3.token_id = t1.token_id + 2
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(coalesce(nullif(t1.lemma, ''), t1.token_text)) = ?
+      AND lower(coalesce(nullif(t2.lemma, ''), t2.token_text)) = ?
+      AND lower(coalesce(nullif(t3.lemma, ''), t3.token_text)) = ?
+                """,
+                tr_phrase, tr_w1, tr_w2, tr_w3,
+            )
 
-  -- 2) lemma matches: relemmatized
-  SELECT cs.grela_id, cs.sentence_id, cs.seq_full,
-         ?::INT, 'lemma', 'relemmatized', ?::VARCHAR
-  FROM base_content cs
-  WHERE ? AND (
-    (? = 1 AND {LEMMA_NORM} = ?)
-    OR (? = 2 AND {NORM_SQL('cs.n2')} = ?)
-    OR (? = 3 AND {NORM_SQL('cs.n3')} = ?)
-  )
+    # ---- 3) token_text canonical ----
+    if tc:
+        if tc_len == 1:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t1.token_id    AS end_token_id,
+      'token'        AS matched_by,
+      'canonical'    AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(t1.token_text) = ?
+                """,
+                tc_phrase, tc_w1,
+            )
+        elif tc_len == 2:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t2.token_id    AS end_token_id,
+      'token'        AS matched_by,
+      'canonical'    AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(t1.token_text) = ?
+      AND lower(t2.token_text) = ?
+                """,
+                tc_phrase, tc_w1, tc_w2,
+            )
+        elif tc_len == 3:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t3.token_id    AS end_token_id,
+      'token'        AS matched_by,
+      'canonical'    AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN tokens t3
+      ON t3.grela_id = t1.grela_id
+     AND t3.token_id = t1.token_id + 2
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(t1.token_text) = ?
+      AND lower(t2.token_text) = ?
+      AND lower(t3.token_text) = ?
+                """,
+                tc_phrase, tc_w1, tc_w2, tc_w3,
+            )
 
-  UNION ALL
+    # ---- 4) token_text relemmatized ----
+    if tr:
+        if tr_len == 1:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t1.token_id    AS end_token_id,
+      'token'        AS matched_by,
+      'relemmatized' AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(t1.token_text) = ?
+                """,
+                tr_phrase, tr_w1,
+            )
+        elif tr_len == 2:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t2.token_id    AS end_token_id,
+      'token'        AS matched_by,
+      'relemmatized' AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(t1.token_text) = ?
+      AND lower(t2.token_text) = ?
+                """,
+                tr_phrase, tr_w1, tr_w2,
+            )
+        elif tr_len == 3:
+            add_select(
+                f"""
+    SELECT
+      t1.grela_id,
+      t1.sentence_id AS target_sentence_id,
+      t1.token_id    AS start_token_id,
+      t3.token_id    AS end_token_id,
+      'token'        AS matched_by,
+      'relemmatized' AS target_from,
+      ?::VARCHAR     AS target_phrase
+    FROM tokens t1
+    JOIN tokens t2
+      ON t2.grela_id = t1.grela_id
+     AND t2.token_id = t1.token_id + 1
+    JOIN tokens t3
+      ON t3.grela_id = t1.grela_id
+     AND t3.token_id = t1.token_id + 2
+    JOIN works w ON w.grela_id = t1.grela_id
+    WHERE {corpus_pred}
+      AND lower(t1.token_text) = ?
+      AND lower(t2.token_text) = ?
+      AND lower(t3.token_text) = ?
+                """,
+                tr_phrase, tr_w1, tr_w2, tr_w3,
+            )
 
-  -- 3) token_text matches: canonical (strict adjacency)
-  SELECT f1.grela_id, f1.sentence_id, f1.seq_full,
-         ?::INT, 'token', 'canonical', ?::VARCHAR
-  FROM base_full f1
-  LEFT JOIN base_full f2
-    ON f2.grela_id = f1.grela_id AND f2.seq_full = f1.seq_full + 1
-  LEFT JOIN base_full f3
-    ON f3.grela_id = f1.grela_id AND f3.seq_full = f1.seq_full + 2
-  WHERE ? AND (
-    (? = 1 AND {NORM_SQL('f1.token_text_lower')} = ?)
-    OR (? = 2 AND {NORM_SQL('f1.token_text_lower')} = ? AND {NORM_SQL('f2.token_text_lower')} = ?)
-    OR (? = 3 AND {NORM_SQL('f1.token_text_lower')} = ? AND {NORM_SQL('f2.token_text_lower')} = ? AND {NORM_SQL('f3.token_text_lower')} = ?)
-  )
+    if not raw_selects:
+        raise RuntimeError("No match branches active – this should not happen.")
 
-  UNION ALL
+    raw_matches_sql = "\nUNION ALL\n".join(raw_selects)
+    limit_clause = f"\nLIMIT {int(max_hits)}" if max_hits is not None else ""
 
-  -- 4) token_text matches: relemmatized (strict adjacency)
-  SELECT f1.grela_id, f1.sentence_id, f1.seq_full,
-         ?::INT, 'token', 'relemmatized', ?::VARCHAR
-  FROM base_full f1
-  LEFT JOIN base_full f2
-    ON f2.grela_id = f1.grela_id AND f2.seq_full = f1.seq_full + 1
-  LEFT JOIN base_full f3
-    ON f3.grela_id = f1.grela_id AND f3.seq_full = f1.seq_full + 2
-  WHERE ? AND (
-    (? = 1 AND {NORM_SQL('f1.token_text_lower')} = ?)
-    OR (? = 2 AND {NORM_SQL('f1.token_text_lower')} = ? AND {NORM_SQL('f2.token_text_lower')} = ?)
-    OR (? = 3 AND {NORM_SQL('f1.token_text_lower')} = ? AND {NORM_SQL('f2.token_text_lower')} = ? AND {NORM_SQL('f3.token_text_lower')} = ?)
-  )
+    sql = f"""
+CREATE OR REPLACE TEMP TABLE {table_name} AS
+WITH raw_matches AS (
+{raw_matches_sql}
 ),
 ranked AS (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY grela_id, target_sentence_id, start_seq_full
-    ORDER BY
-      CASE matched_by WHEN 'lemma' THEN 0 ELSE 1 END,
-      CASE target_from WHEN 'canonical' THEN 0 ELSE 1 END
-  ) AS rn
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY grela_id, target_sentence_id, start_token_id
+           ORDER BY
+             CASE matched_by WHEN 'lemma' THEN 0 ELSE 1 END,
+             CASE target_from WHEN 'canonical' THEN 0 ELSE 1 END
+         ) AS rn
   FROM raw_matches
 ),
 uniq_matches AS (
-  SELECT grela_id, target_sentence_id, start_seq_full, target_len, matched_by, target_from, target_phrase
+  SELECT
+    grela_id,
+    target_sentence_id,
+    start_token_id,
+    end_token_id,
+    matched_by,
+    target_from,
+    target_phrase
   FROM ranked
   WHERE rn = 1
 ),
-bounds AS (
-  SELECT m.grela_id, m.target_sentence_id, m.start_seq_full, m.target_len, m.matched_by, m.target_from, m.target_phrase,
-         CASE m.target_len WHEN 1 THEN m.start_seq_full WHEN 2 THEN cs.next1_seq_full WHEN 3 THEN cs.next2_seq_full END AS end_seq_full
-  FROM uniq_matches m
-  JOIN base_content cs
-    ON cs.grela_id = m.grela_id AND cs.seq_full = m.start_seq_full
-  WHERE CASE m.target_len
-          WHEN 1 THEN TRUE
-          WHEN 2 THEN cs.next1_seq_full = m.start_seq_full + 1
-          WHEN 3 THEN cs.next2_seq_full = m.start_seq_full + 2
-        END
+spans AS (
+  SELECT
+    ROW_NUMBER() OVER (
+      ORDER BY grela_id, target_sentence_id, start_token_id
+    ) AS span_idx,
+    *
+  FROM uniq_matches
+)
+SELECT *
+FROM spans
+{limit_clause};
+"""
+
+    conn.execute(sql, params)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: extract concordance (KWIC) from spans
+# ---------------------------------------------------------------------------
+
+def kwic_from_spans(
+    conn: duckdb.DuckDBPyConnection,
+    spans_table: str = "temp_target_spans",
+    window: int = 10,
+    include_tokens: bool = True,
+    span_idx_min: Optional[int] = None,
+    span_idx_max: Optional[int] = None,
+    max_hits: Optional[int] = None,
+    out_path: Optional[str] = None,
+):
+    """
+    Phase 2: Take a spans table (created by create_target_spans_table) and
+    build full KWIC.
+
+    Spans table is expected to have:
+      span_idx, grela_id, target_sentence_id, start_token_id, end_token_id,
+      matched_by, target_from, target_phrase
+
+    You can:
+      - provide span_idx_min & span_idx_max to process a chunk, OR
+      - leave them None and optionally use max_hits to cap total matches.
+
+    Output columns now include work metadata:
+      - author
+      - title
+      - not_before
+      - not_after
+    """
+
+    span_filter = ""
+    span_params: list = []
+
+    if span_idx_min is not None and span_idx_max is not None:
+        span_filter = "WHERE span_idx BETWEEN ? AND ?"
+        span_params = [span_idx_min, span_idx_max]
+        limit_clause = ""  # range wins; no extra LIMIT
+    else:
+        span_filter = ""
+        span_params = []
+        limit_clause = f"LIMIT {int(max_hits)}" if max_hits is not None else ""
+
+    sql_core = f"""
+WITH uniq_matches AS (
+  SELECT *
+  FROM {spans_table}
+  {span_filter}
+  ORDER BY grela_id, target_sentence_id, start_token_id
+  {limit_clause}
 ),
 context AS (
-  SELECT b.grela_id, b.target_sentence_id, b.start_seq_full, b.target_len, b.matched_by, b.target_from, b.target_phrase,
-         f.sentence_id, f.token_id, f.token_text, f.lemma_lower, f.pos, f.ref, f.char_start, f.char_end,
-         ROW_NUMBER() OVER (
-           PARTITION BY b.grela_id, b.target_sentence_id, b.start_seq_full
-           ORDER BY f.seq_full
-         ) AS ord,
-         (f.seq_full BETWEEN b.start_seq_full AND b.end_seq_full) AS is_target
-  FROM bounds b
-  JOIN base_full f
-    ON f.grela_id = b.grela_id
-   AND f.seq_full BETWEEN (b.start_seq_full - ?) AND (b.end_seq_full + ?)
+  SELECT
+    m.grela_id,
+    m.target_sentence_id,
+    m.start_token_id,
+    m.end_token_id,
+    m.matched_by,
+    m.target_from,
+    m.target_phrase,
+    t.sentence_id,
+    t.token_id,
+    t.token_text,
+    LOWER(t.lemma) AS lemma_lower,
+    t.pos,
+    t.ref,
+    t.char_start,
+    t.char_end,
+    ROW_NUMBER() OVER (
+      PARTITION BY m.grela_id, m.target_sentence_id, m.start_token_id
+      ORDER BY t.token_id
+    ) AS ord,
+    (t.token_id BETWEEN m.start_token_id AND m.end_token_id) AS is_target
+  FROM uniq_matches m
+  JOIN tokens t
+    ON t.grela_id = m.grela_id
+   AND t.token_id BETWEEN (m.start_token_id - ?) AND (m.end_token_id + ?)
 ),
 needed_sentences AS (
   SELECT DISTINCT grela_id, target_sentence_id AS sentence_id
@@ -300,15 +522,22 @@ needed_sentences AS (
 ),
 sentence_map AS (
   SELECT
-    e.grela_id, e.sentence_id, e.token_id,
-    ROW_NUMBER() OVER (PARTITION BY e.grela_id, e.sentence_id ORDER BY e.char_start) - 1 AS sent_idx0
-  FROM base_full e
+    t.grela_id,
+    t.sentence_id,
+    t.token_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY t.grela_id, t.sentence_id
+      ORDER BY t.char_start
+    ) - 1 AS sent_idx0
+  FROM tokens t
   JOIN needed_sentences n
-    ON n.grela_id = e.grela_id AND n.sentence_id = e.sentence_id
+    ON n.grela_id = t.grela_id AND n.sentence_id = t.sentence_id
 ),
 target_enrich AS (
   SELECT
-    c.grela_id, c.target_sentence_id, c.start_seq_full,
+    c.grela_id,
+    c.target_sentence_id,
+    c.start_token_id,
     LIST(c.token_text)   FILTER (WHERE c.is_target) AS target_phrase,
     LIST(c.lemma_lower)  FILTER (WHERE c.is_target) AS target_lemmata,
     LIST(c.token_id)     FILTER (WHERE c.is_target) AS target_token_ids,
@@ -319,18 +548,18 @@ target_enrich AS (
     ON sm.grela_id = c.grela_id
    AND sm.sentence_id = c.sentence_id
    AND sm.token_id = c.token_id
-  GROUP BY c.grela_id, c.target_sentence_id, c.start_seq_full
+  GROUP BY c.grela_id, c.target_sentence_id, c.start_token_id
 )
 """
 
-    # ---------- tails as before ----------
+    # ---------- heavy tail (with kwic_tokens & sentence_tokens) ----------
     sql_heavy_tail = """
 ,agg_kwic AS (
   SELECT
-    grela_id, target_sentence_id, start_seq_full,
-    ANY_VALUE(target_len)   AS target_len,
-    ANY_VALUE(matched_by)   AS matched_by,
-    ANY_VALUE(target_from)  AS target_from,
+    grela_id, target_sentence_id, start_token_id,
+    ANY_VALUE(matched_by)    AS matched_by,
+    ANY_VALUE(target_from)   AS target_from,
+    ANY_VALUE(target_phrase) AS target_phrase,
     LIST(sentence_id ORDER BY ord)           AS window_sentence_ids,
     STRING_AGG(token_text, ' ' ORDER BY ord) AS kwic_text,
     LIST(
@@ -347,34 +576,38 @@ target_enrich AS (
       ORDER BY ord
     ) AS kwic_tokens
   FROM context
-  GROUP BY grela_id, target_sentence_id, start_seq_full
+  GROUP BY grela_id, target_sentence_id, start_token_id
 ),
 target_sentence_texts AS (
-  SELECT e.grela_id, e.sentence_id,
-         STRING_AGG(e.token_text, ' ' ORDER BY e.char_start) AS sentence_text
-  FROM base_full e
+  SELECT
+    t.grela_id,
+    t.sentence_id,
+    STRING_AGG(t.token_text, ' ' ORDER BY t.char_start) AS sentence_text
+  FROM tokens t
   JOIN needed_sentences n
-    ON n.grela_id = e.grela_id AND n.sentence_id = e.sentence_id
-  GROUP BY e.grela_id, e.sentence_id
+    ON n.grela_id = t.grela_id AND n.sentence_id = t.sentence_id
+  GROUP BY t.grela_id, t.sentence_id
 ),
 target_sentence_tokens AS (
-  SELECT e.grela_id, e.sentence_id,
-         LIST(
-           STRUCT_PACK(
-             token_id := e.token_id,
-             token_text := e.token_text,
-             lemma := e.lemma_lower,
-             pos := e.pos,
-             ref := e.ref,
-             char_start := e.char_start,
-             char_end := e.char_end
-           )
-           ORDER BY e.char_start
-         ) AS sentence_tokens
-  FROM base_full e
+  SELECT
+    t.grela_id,
+    t.sentence_id,
+    LIST(
+      STRUCT_PACK(
+        token_id := t.token_id,
+        token_text := t.token_text,
+        lemma := LOWER(t.lemma),
+        pos := t.pos,
+        ref := t.ref,
+        char_start := t.char_start,
+        char_end := t.char_end
+      )
+      ORDER BY t.char_start
+    ) AS sentence_tokens
+  FROM tokens t
   JOIN needed_sentences n
-    ON n.grela_id = e.grela_id AND n.sentence_id = e.sentence_id
-  GROUP BY e.grela_id, e.sentence_id
+    ON n.grela_id = t.grela_id AND n.sentence_id = t.sentence_id
+  GROUP BY t.grela_id, t.sentence_id
 )
 SELECT
   te.target_phrase,
@@ -391,38 +624,47 @@ SELECT
   a.kwic_text,
   a.kwic_tokens,
   tst.sentence_text         AS target_sentence_text,
-  tstok.sentence_tokens     AS target_sentence_tokens
+  tstok.sentence_tokens     AS target_sentence_tokens,
+  w.author,
+  w.title,
+  w.not_before,
+  w.not_after
 FROM agg_kwic a
 JOIN target_enrich te
   ON te.grela_id = a.grela_id
  AND te.target_sentence_id = a.target_sentence_id
- AND te.start_seq_full = a.start_seq_full
+ AND te.start_token_id = a.start_token_id
 LEFT JOIN target_sentence_texts  tst
   ON tst.grela_id = a.grela_id AND tst.sentence_id = a.target_sentence_id
 LEFT JOIN target_sentence_tokens tstok
   ON tstok.grela_id = a.grela_id AND tstok.sentence_id = a.target_sentence_id
-ORDER BY a.grela_id, a.target_sentence_id, a.start_seq_full
+LEFT JOIN works w
+  ON w.grela_id = a.grela_id
+ORDER BY a.grela_id, a.target_sentence_id, a.start_token_id
 """
 
+    # ---------- light tail (no kwic_tokens / sentence_tokens) ----------
     sql_light_tail = """
 ,agg_kwic AS (
   SELECT
-    grela_id, target_sentence_id, start_seq_full,
-    ANY_VALUE(target_len)   AS target_len,
-    ANY_VALUE(matched_by)   AS matched_by,
-    ANY_VALUE(target_from)  AS target_from,
+    grela_id, target_sentence_id, start_token_id,
+    ANY_VALUE(matched_by)    AS matched_by,
+    ANY_VALUE(target_from)   AS target_from,
+    ANY_VALUE(target_phrase) AS target_phrase,
     LIST(sentence_id ORDER BY ord)           AS window_sentence_ids,
     STRING_AGG(token_text, ' ' ORDER BY ord) AS kwic_text
   FROM context
-  GROUP BY grela_id, target_sentence_id, start_seq_full
+  GROUP BY grela_id, target_sentence_id, start_token_id
 ),
 target_sentence_texts AS (
-  SELECT e.grela_id, e.sentence_id,
-         STRING_AGG(e.token_text, ' ' ORDER BY e.char_start) AS sentence_text
-  FROM base_full e
+  SELECT
+    t.grela_id,
+    t.sentence_id,
+    STRING_AGG(t.token_text, ' ' ORDER BY t.char_start) AS sentence_text
+  FROM tokens t
   JOIN needed_sentences n
-    ON n.grela_id = e.grela_id AND n.sentence_id = e.sentence_id
-  GROUP BY e.grela_id, e.sentence_id
+    ON n.grela_id = t.grela_id AND n.sentence_id = t.sentence_id
+  GROUP BY t.grela_id, t.sentence_id
 )
 SELECT
   te.target_phrase,
@@ -439,50 +681,33 @@ SELECT
   a.kwic_text,
   NULL                      AS kwic_tokens,
   tst.sentence_text         AS target_sentence_text,
-  NULL                      AS target_sentence_tokens
+  NULL                      AS target_sentence_tokens,
+  w.author,
+  w.title,
+  w.not_before,
+  w.not_after
 FROM agg_kwic a
 JOIN target_enrich te
   ON te.grela_id = a.grela_id
  AND te.target_sentence_id = a.target_sentence_id
- AND te.start_seq_full = a.start_seq_full
+ AND te.start_token_id = a.start_token_id
 LEFT JOIN target_sentence_texts  tst
   ON tst.grela_id = a.grela_id AND tst.sentence_id = a.target_sentence_id
-ORDER BY a.grela_id, a.target_sentence_id, a.start_seq_full
+LEFT JOIN works w
+  ON w.grela_id = a.grela_id
+ORDER BY a.grela_id, a.target_sentence_id, a.start_token_id
 """
 
     sql_tail = sql_heavy_tail if include_tokens else sql_light_tail
     sql = sql_core + sql_tail
 
-    if max_hits is not None:
-        sql += f"\nLIMIT {int(max_hits)}"
+    params = span_params + [window, window]
 
-    # ---------- parameters ----------
-    params = [
-        # 1) lemma canonical
-        tc_len, tc_phrase or "", bool(tc),
-        tc_len, (tc or ""), tc_len, (tc or ""), tc_len, (tc or ""),
-        # 2) lemma relemmatized
-        tr_len, tr_phrase or "", bool(tr),
-        tr_len, (tr or ""), tr_len, (tr or ""), tr_len, (tr or ""),
-        # 3) token canonical
-        tc_len, tc_phrase or "", bool(tc),
-        tc_len, tc_w1,
-        tc_len, tc_w1, tc_w2,
-        tc_len, tc_w1, tc_w2, tc_w3,
-        # 4) token relemmatized
-        tr_len, tr_phrase or "", bool(tr),
-        tr_len, tr_w1,
-        tr_len, tr_w1, tr_w2,
-        tr_len, tr_w1, tr_w2, tr_w3,
-        # window
-        window, window,
-    ]
-
-    # ---------- execute ----------
     if out_path:
-        sql_nosemi = sql.rstrip().rstrip(';')
-        out_quoted = "'" + out_path.replace("'", "''") + "'"
-        conn.execute(f"COPY ({sql_nosemi}) TO {out_quoted} (FORMAT PARQUET);", params)
+        sql_nosemi = sql.rstrip().rstrip(";")
+        path_str = str(out_path)  # handle Path or str
+        out_q = "'" + path_str.replace("'", "''") + "'"
+        conn.execute(f"COPY ({sql_nosemi}) TO {out_q} (FORMAT PARQUET);", params)
         return None
     else:
         return conn.execute(sql, params).fetch_df()
