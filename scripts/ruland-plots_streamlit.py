@@ -1,235 +1,413 @@
-# Streamlit App for Visualizing Ruland's Entries
+# streamlit_app.py
+import re
+from pathlib import Path
+from collections import Counter
+
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from collections import Counter
-import numpy as np
 import streamlit as st
 import fnmatch
 
-# Title and description for the app
+
+# ---------------------------
+# Config
+# ---------------------------
+st.set_page_config(page_title="Ruland in Usage", layout="wide")
+
+INDEX_PARQUET = "../data/large_files/ruland-emlap-grela.parquet"
+HITS_DIR = Path("../data/large_files/emlap_ruland_instances/")  # folder with per-entry parquet hit files
+
+
+# ---------------------------
+# Cached loaders
+# ---------------------------
+@st.cache_data(show_spinner=True)
+def load_emlap_metadata():
+    emlap_metadata = pd.read_csv(
+        "https://raw.githubusercontent.com/CCS-ZCU/EMLAP_ETL/refs/heads/master/data/emlap_metadata.csv",
+        sep=";",
+    )
+
+    # label used in plots
+    emlap_metadata["labeldate"] = emlap_metadata.apply(
+        lambda row: f"{row['working_title']} ({row['date_publication']})",
+        axis=1,
+    )
+
+    # Build "Noscemus IDs that are represented in EMLAP"
+    if "if_noscemus_id" in emlap_metadata.columns:
+        noscemus_emlap_ids = [
+            str(int(x)) for x in emlap_metadata["if_noscemus_id"].unique() if pd.notna(x)
+        ]
+    else:
+        noscemus_emlap_ids = []
+
+    return emlap_metadata, set(noscemus_emlap_ids)
+
+
+@st.cache_data(show_spinner=True)
+def load_lexeme_index():
+    df = pd.read_parquet(INDEX_PARQUET)
+
+    # keep only what we need for searching + counts + hit-file loading
+    keep = [
+        "Lemma",
+        "instance_fname",
+        "emlap_instances_N",
+        "noscemus_instances_N",
+        "cc_instances_N",
+    ]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].drop_duplicates(subset=["Lemma"]).copy()
+
+    df["Lemma"] = df["Lemma"].astype("string")
+    if "instance_fname" in df.columns:
+        df["instance_fname"] = df["instance_fname"].astype("string")
+
+    # counts as ints (safe)
+    for c in ["emlap_instances_N", "noscemus_instances_N", "cc_instances_N"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    return df
+
+
+@st.cache_data(show_spinner=True)
+def load_hits_df(fname: str) -> pd.DataFrame:
+    """Load full hit file for an entry. Cached per fname."""
+    if not fname:
+        return pd.DataFrame()
+    path = HITS_DIR / fname
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+# ---------------------------
+# Helpers: ID parsing & filtering
+# ---------------------------
+def corpus_of_grela(grela_id: str) -> str:
+    if not isinstance(grela_id, str):
+        return "other"
+    if grela_id.startswith("emlap"):
+        return "emlap"
+    if grela_id.startswith("noscemus"):
+        return "noscemus"
+    if grela_id.startswith("cc"):
+        return "cc"
+    return "other"
+
+
+def _extract_after_prefix(grela_id: str, prefix: str) -> str | None:
+    """
+    Extract ID part after prefixes like:
+      emlap_123, emlap:123, noscemus_456, noscemus:456
+    """
+    if not isinstance(grela_id, str):
+        return None
+    m = re.match(rf"^{re.escape(prefix)}[:_](.+)$", grela_id)
+    return m.group(1) if m else None
+
+
+def emlap_work_id(grela_id: str) -> str | None:
+    return _extract_after_prefix(grela_id, "emlap")
+
+
+def noscemus_id(grela_id: str) -> str | None:
+    raw = _extract_after_prefix(grela_id, "noscemus")
+    if raw is None:
+        return None
+    # usually numeric; normalize like your list does (string of int)
+    m = re.match(r"^(\d+)", raw)
+    return str(int(m.group(1))) if m else raw
+
+
+def filter_hits_for_table(
+    hits_df: pd.DataFrame,
+    show_emlap: bool,
+    show_nosc: bool,
+    show_cc: bool,
+    noscemus_emlap_ids: set[str],
+    drop_emlap_overlap_from_noscemus: bool = True,
+) -> pd.DataFrame:
+    if hits_df.empty or "grela_id" not in hits_df.columns:
+        return pd.DataFrame()
+
+    df = hits_df.copy()
+    df["corpus"] = df["grela_id"].astype("string").map(corpus_of_grela)
+
+    # optional: remove noscemus hits that overlap with emlap (via emlap_metadata.if_noscemus_id)
+    if drop_emlap_overlap_from_noscemus:
+        nos_ids = df.loc[df["corpus"] == "noscemus", "grela_id"].astype("string").map(noscemus_id)
+        overlap_mask = (df["corpus"] == "noscemus") & nos_ids.isin(noscemus_emlap_ids)
+        df = df.loc[~overlap_mask].copy()
+
+    mask = (
+        (show_emlap & (df["corpus"] == "emlap")) |
+        (show_nosc & (df["corpus"] == "noscemus")) |
+        (show_cc   & (df["corpus"] == "cc"))
+    )
+    return df.loc[mask].copy()
+
+
+def find_matching_lemmas(pattern: str, lexeme_index: pd.DataFrame):
+    """
+    Return list of dicts with Lemma + counts + instance_fname, sorted by emlap_instances_N desc.
+    Supports '*' wildcard (fnmatch).
+    """
+    df = lexeme_index.dropna(subset=["Lemma"]).copy()
+    df["Lemma"] = df["Lemma"].astype(str)
+
+    if pattern is None:
+        pattern = ""
+
+    pattern = pattern.strip()
+    if pattern == "":
+        return []
+
+    if "*" in pattern:
+        rex = fnmatch.translate(pattern)
+        df = df[df["Lemma"].str.contains(rex, case=False, regex=True, na=False)]
+    else:
+        df = df[df["Lemma"].str.contains(pattern, case=False, regex=False, na=False)]
+
+    sort_col = "emlap_instances_N" if "emlap_instances_N" in df.columns else "Lemma"
+    df = df.sort_values(sort_col, ascending=False)
+
+    cols = ["Lemma", "instance_fname", "emlap_instances_N", "noscemus_instances_N", "cc_instances_N"]
+    cols = [c for c in cols if c in df.columns]
+    return df[cols].to_dict("records")
+
+
+# ---------------------------
+# Plotting from hits
+# ---------------------------
+def compute_emlap_distributions_from_hits(hits_df: pd.DataFrame, emlap_metadata: pd.DataFrame):
+    """
+    Build:
+      - bidecade grouped df: Bidecade, Frequency, tokens_N, RelativeFrequency
+      - per-work df: metadata + Frequency + RelativeFrequency
+    from *hits_df* (EMLAP subset only).
+    """
+    if hits_df.empty or "grela_id" not in hits_df.columns:
+        return None, None
+
+    em = hits_df[hits_df["grela_id"].astype("string").str.startswith("emlap", na=False)].copy()
+    if em.empty:
+        return None, None
+
+    em["work_id"] = em["grela_id"].astype("string").map(emlap_work_id).astype("string")
+    counts = Counter(em["work_id"].dropna().astype(str).tolist())
+
+    md = emlap_metadata.copy()
+    md["Frequency"] = md["no."].astype(str).map(counts).fillna(0).astype(int)
+    md["RelativeFrequency"] = md["Frequency"] / md["tokens_N"]
+
+    def bidecade(year):
+        if pd.isna(year):
+            return None
+        y = int(year)
+        start = (y // 20) * 20
+        return f"{start}-{start+19}"
+
+    md["Bidecade"] = md["date_publication"].apply(bidecade)
+
+    grouped = (
+        md.groupby("Bidecade", dropna=True)[["Frequency", "tokens_N"]]
+          .sum()
+          .reset_index()
+          .sort_values(by="Bidecade", key=lambda c: c.str.extract(r"(\d+)")[0].astype(int))
+    )
+    grouped["RelativeFrequency"] = grouped["Frequency"] / grouped["tokens_N"]
+
+    return grouped, md
+
+
+def plot_emlap_fourpanel(entry: str, grouped, perwork):
+    fig, axes = plt.subplots(2, 2, figsize=(30, 12), dpi=250)
+
+    # Abs by bidecade
+    ax1 = axes[0, 0]
+    ax1.bar(grouped["Bidecade"], grouped["Frequency"], color="darkblue")
+    ax1.set_xlabel("Bidecades", fontsize=11)
+    ax1.set_ylabel("Absolute Frequency", fontsize=11)
+    ax1.set_title(f"Absolute Frequency of '{entry}' by Bidecades", fontsize=13)
+    ax1.set_xticks(range(len(grouped["Bidecade"])))
+    ax1.set_xticklabels(grouped["Bidecade"], rotation=90, fontsize=9)
+
+    # Rel by bidecade
+    ax2 = axes[0, 1]
+    ax2.bar(grouped["Bidecade"], grouped["RelativeFrequency"], color="darkgreen")
+    ax2.set_xlabel("Bidecades", fontsize=11)
+    ax2.set_ylabel("Relative Frequency (Frequency / tokens_N)", fontsize=11)
+    ax2.set_title(f"Relative Frequency of '{entry}' by Bidecades", fontsize=13)
+    ax2.set_xticks(range(len(grouped["Bidecade"])))
+    ax2.set_xticklabels(grouped["Bidecade"], rotation=90, fontsize=9)
+
+    # Abs by works
+    ax3 = axes[1, 0]
+    ax3.bar(perwork["labeldate"], perwork["Frequency"], color="darkblue")
+    ax3.set_xlabel("Works", fontsize=11)
+    ax3.set_ylabel("Absolute Frequency", fontsize=11)
+    ax3.set_title(f"Absolute Frequency of '{entry}' by Works", fontsize=13)
+    ax3.set_xticks(range(len(perwork["labeldate"])))
+    ax3.set_xticklabels(perwork["labeldate"], rotation=90, fontsize=8)
+
+    # Rel by works
+    ax4 = axes[1, 1]
+    ax4.bar(perwork["labeldate"], perwork["RelativeFrequency"], color="darkgreen")
+    ax4.set_xlabel("Works", fontsize=11)
+    ax4.set_ylabel("Relative Frequency (Frequency / tokens_N)", fontsize=11)
+    ax4.set_title(f"Relative Frequency of '{entry}' by Works", fontsize=13)
+    ax4.set_xticks(range(len(perwork["labeldate"])))
+    ax4.set_xticklabels(perwork["labeldate"], rotation=90, fontsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------
+# UI
+# ---------------------------
 st.title("Ruland in Usage")
 st.markdown(
     """
-    This app visualizes the distribution of instances from Ruland's entries by bidecades aggregates and across individual works from the EMLAP corpus. It gives you both absolute and relative values.
+This app visualizes the distribution of instances from Ruland's entries across **EMLAP works**
+(absolute + relative), and lets you browse full cross-corpus hits (**EMLAP / Noscemus / Corpus Corporum**)
+when available.
 
-    The source code for the app is available from [here](https://github.com/CCS-ZCU/dictionary-emlap).
-
-    Enter an entry (e.g., **Mercurius metallorum**) to see the plots.
-    """
+Source code: https://github.com/CCS-ZCU/dictionary-emlap
+"""
 )
 
+emlap_metadata, noscemus_emlap_ids = load_emlap_metadata()
+lexeme_index = load_lexeme_index()
 
-# Load data files with caching
-@st.cache_data
-def load_data():
-    # Load entries JSON file
-    entries_df = pd.read_json("../data/large_files/ruland-emlap.json")
+# Sidebar controls
+st.sidebar.header("Search")
+query = st.sidebar.text_input("Ruland's entry (supports * wildcard)", value="Mercurius metallorum")
 
-    # Remove duplicate rows based on 'Lemma' and 'emlap_instances_N' (or all columns if preferred)
-    entries_df = entries_df.drop_duplicates(subset=["Lemma", "emlap_instances_N"])
+st.sidebar.header("Instances table")
+load_full_hits = st.sidebar.toggle(
+    "Load full cross-corpus hit file (uses instance_fname)",
+    value=True,
+)
 
-    # Load metadata from the web
-    emlap_metadata = pd.read_csv(
-        "https://raw.githubusercontent.com/CCS-ZCU/EMLAP_ETL/refs/heads/master/data/emlap_metadata.csv",
-        sep=";"
-    )
+st.sidebar.caption("Corpus filters (apply to the instances table):")
+show_emlap = st.sidebar.checkbox("EMLAP", value=True)
+show_nosc = st.sidebar.checkbox("NOSCEMUS", value=True)
+show_cc = st.sidebar.checkbox("Corpus Corporum (CC)", value=True)
 
-    # Add a labeldate column to metadata
-    emlap_metadata["labeldate"] = emlap_metadata.apply(
-        lambda row: row["working_title"] + " ({})".format(str(row["date_publication"])),
-        axis=1
-    )
+drop_overlap = st.sidebar.checkbox(
+    "Filter out Noscemus hits that overlap with EMLAP (if_noscemus_id)",
+    value=True,
+)
 
-    # Sort metadata by the date of publication
-    emlap_metadata.sort_values("date_publication", ascending=True, inplace=True)
+# Find matches
+matches = find_matching_lemmas(query, lexeme_index)
 
-    return entries_df, emlap_metadata
-
-
-# Load the data
-entries_df, emlap_metadata = load_data()
-
-
-# Function to find matching keys with corresponding 'emlap_instances_N' values
-def find_matching_keys(pattern, entries_df):
-    """
-    Finds matching keys in entries_df['Lemma'] with their corresponding
-    'emlap_instances_N' values, sorted from highest to lowest.
-
-    Args:
-        pattern (str): The search pattern (supports wildcards '*').
-        entries_df (DataFrame): DataFrame containing 'Lemma' and 'emlap_instances_N' columns.
-
-    Returns:
-        list: List of tuples in the format [(key, n), ...] where 'key' is the lemma
-              and 'n' is the corresponding emlap_instances_N value, sorted by 'n' descending.
-    """
-    # Validate input: Ensure entries_df contains the required columns
-    if not all(col in entries_df.columns for col in ["Lemma", "emlap_instances_N"]):
-        raise ValueError("entries_df must contain 'Lemma' and 'emlap_instances_N' columns.")
-
-    # Filter DataFrame for valid rows (clean NaNs)
-    filtered_df = entries_df.dropna(subset=["Lemma", "emlap_instances_N"]).copy()
-
-    # Ensure column types are consistent
-    filtered_df["Lemma"] = filtered_df["Lemma"].astype(str)
-    filtered_df["emlap_instances_N"] = filtered_df["emlap_instances_N"].astype(int)
-
-    # Match keys using wildcard (*) or substring
-    if "*" in pattern:
-        filtered_df = filtered_df[
-            filtered_df["Lemma"].str.contains(fnmatch.translate(pattern), case=False, regex=True)
-        ]
-    else:
-        filtered_df = filtered_df[
-            filtered_df["Lemma"].str.contains(pattern, case=False, na=False)
-        ]
-
-    # Create the result as sorted tuple list [(key, n), ...]
-    result = filtered_df.sort_values("emlap_instances_N", ascending=False).apply(
-        lambda row: (row["Lemma"], row["emlap_instances_N"]), axis=1
-    ).tolist()
-
-    # Return the sorted list of matches
-    return result
-
-
-# Function to generate plots for a selected entry
-def generate_plots(selected_entry):
-    # Get instances IDs for the selected entry
-    instances = entries_df[entries_df["Lemma"] == selected_entry]["instances_ids"]
-    instances_texts_data = entries_df[entries_df["Lemma"] == selected_entry]["emlap_instances"]
-
-    # Handle cases where there is no data for the selected entry
-    if len(instances) == 0 or len(instances_texts_data) == 0:
-        st.error("No data available for the selected entry.")
-        return
-
-    # Convert instances and texts into usable formats
-    instances_ids = instances.tolist()[0]  # Get the list of instance IDs
-    instances_texts_list = instances_texts_data.tolist()[0]  # Get the list of instance details
-
-    # Create a DataFrame from the instances texts list
-    instances_df = pd.DataFrame(
-        instances_texts_list,
-        columns=["emlap ID", "sentence index", "sentence text"]
-    )
-
-    # Count the frequency of each instance ID
-    counter = Counter(instances_ids)
-
-    # Copy metadata and calculate frequency
-    emlap_metadata_instances = emlap_metadata.copy()
-    emlap_metadata_instances["Frequency"] = (
-        emlap_metadata_instances["No."].map(counter).fillna(0).astype(int)
-    )
-
-    # Add bidecade labels to the DataFrame
-    def get_bidecade_label(year):
-        if not np.isnan(year):  # Handle NaN years safely
-            start = (year // 20) * 20  # Determine the starting year of the bidecade
-            end = start + 19  # Determine the ending year of the bidecade
-            return f"{start}-{end}"
-        return None
-
-    emlap_metadata_instances["Bidecade"] = emlap_metadata_instances["date_publication"].apply(get_bidecade_label)
-
-    # Group by Bidecade and sum frequencies and tokens_N
-    emlap_instances_grouped = (
-        emlap_metadata_instances.groupby("Bidecade", dropna=True)[["Frequency", "tokens_N"]]
-        .sum()
-        .reset_index()
-    )
-
-    # Sort bidecade intervals numerically
-    emlap_instances_grouped = emlap_instances_grouped.sort_values(
-        by="Bidecade",
-        key=lambda col: col.str.extract(r"(\d+)")[0].astype(int)
-    )
-
-    # Calculate relative frequency (Frequency / tokens_N)
-    emlap_instances_grouped["RelativeFrequency"] = (
-        emlap_instances_grouped["Frequency"] / emlap_instances_grouped["tokens_N"]
-    )
-
-    # Absolute frequency by bidecades
-    st.subheader(f"Absolute Frequency of '{selected_entry}' by Bidecades")
-    fig1, ax1 = plt.subplots(figsize=(12, 6))
-    ax1.bar(
-        emlap_instances_grouped["Bidecade"],
-        emlap_instances_grouped["Frequency"],
-        color="blue"
-    )
-    ax1.set_xlabel("Bidecades", fontsize=12)
-    ax1.set_ylabel("Absolute Frequency", fontsize=12)
-    ax1.set_xticklabels(emlap_instances_grouped["Bidecade"], rotation=90)
-    st.pyplot(fig1)
-
-    # Relative frequency by bidecades
-    st.subheader(f"Relative Frequency of '{selected_entry}' by Bidecades")
-    fig2, ax2 = plt.subplots(figsize=(12, 6))
-    ax2.bar(
-        emlap_instances_grouped["Bidecade"],
-        emlap_instances_grouped["RelativeFrequency"],
-        color="orange"
-    )
-    ax2.set_xlabel("Bidecades", fontsize=12)
-    ax2.set_ylabel("Relative Frequency (Frequency / tokens_N)", fontsize=12)
-    ax2.set_xticklabels(emlap_instances_grouped["Bidecade"], rotation=90)
-    st.pyplot(fig2)
-
-    # Absolute frequency by works
-    st.subheader(f"Absolute Frequency of '{selected_entry}' by Works")
-    fig3, ax3 = plt.subplots(figsize=(15, 6))
-    ax3.bar(
-        emlap_metadata_instances["labeldate"],
-        emlap_metadata_instances["Frequency"],
-        color="green"
-    )
-    ax3.set_xlabel("Works", fontsize=12)
-    ax3.set_ylabel("Absolute Frequency", fontsize=12)
-    ax3.set_xticklabels(emlap_metadata_instances["labeldate"], rotation=90)
-    st.pyplot(fig3)
-
-    # Relative frequency by works
-    st.subheader(f"Relative Frequency of '{selected_entry}' by Works")
-    fig4, ax4 = plt.subplots(figsize=(15, 6))
-    ax4.bar(
-        emlap_metadata_instances["labeldate"],
-        emlap_metadata_instances["Frequency"] / emlap_metadata_instances["tokens_N"],
-        color="red"
-    )
-    ax4.set_xlabel("Works", fontsize=12)
-    ax4.set_ylabel("Relative Frequency (Frequency / tokens_N)", fontsize=12)
-    ax4.set_xticklabels(emlap_metadata_instances["labeldate"], rotation=90)
-    st.pyplot(fig4)
-
-    # Display the instances DataFrame
-    st.subheader(f"Detailed Sentences for '{selected_entry}'")
-    st.write(instances_df)
-
-    # Optional: Add a download button for the instances DataFrame
-    csv_download = instances_df.to_csv(index=False)
-    st.download_button(
-        label=f"Download Sentences for '{selected_entry}'",
-        data=csv_download,
-        file_name=f"{selected_entry}_sentences.csv",
-        mime="text/csv"
-    )
-
-# User input
-entry = st.text_input("Ruland's entry", value="Mercurius metallorum")
-matching_keys = find_matching_keys(entry, entries_df)
-
-if len(matching_keys) == 0:
+if not matches:
     st.error("No entries found. Try a different search.")
-elif len(matching_keys) == 1:
-    st.success(f"One match found: {matching_keys[0][0]}")
-    generate_plots(matching_keys[0][0])
+    st.stop()
+
+# Select entry (if multiple)
+if len(matches) == 1:
+    selected = matches[0]
+    selected_lemma = selected["Lemma"]
 else:
-    st.warning("Multiple matches found. Select one below:")
-    selected_entry = st.selectbox(
-        "Select an entry:", [f"{key} ({count})" for key, count in matching_keys]
+    st.warning("Multiple matches found. Select one:")
+    options = [
+        f"{m['Lemma']}  |  EMLAP:{m.get('emlap_instances_N', 0)}  NOS:{m.get('noscemus_instances_N', 0)}  CC:{m.get('cc_instances_N', 0)}"
+        for m in matches
+    ]
+    chosen = st.selectbox("Select an entry", options)
+    chosen_lemma = chosen.split("|")[0].strip()
+    selected = next(m for m in matches if m["Lemma"] == chosen_lemma)
+    selected_lemma = chosen_lemma
+
+# Summary metrics
+colA, colB, colC = st.columns(3)
+colA.metric("EMLAP instances", int(selected.get("emlap_instances_N", 0)))
+colB.metric("NOSCEMUS instances", int(selected.get("noscemus_instances_N", 0)))
+colC.metric("CC instances", int(selected.get("cc_instances_N", 0)))
+
+# Load hits (optional)
+hits_df = pd.DataFrame()
+if load_full_hits:
+    fname = str(selected.get("instance_fname", "") or "")
+    hits_df = load_hits_df(fname)
+
+    if hits_df.empty:
+        st.warning("Hit file could not be loaded (missing / empty / unreadable). Table will be empty.")
+else:
+    st.info("Turn on “Load full cross-corpus hit file” to browse instance rows across corpora.")
+
+# EMLAP plots (derived from hits if available; otherwise show a message)
+st.header("EMLAP distribution (plots)")
+
+if load_full_hits and not hits_df.empty:
+    grouped, perwork = compute_emlap_distributions_from_hits(hits_df, emlap_metadata)
+    if grouped is None or perwork is None or grouped.empty:
+        st.warning("No EMLAP instances for this entry (or could not derive EMLAP work IDs).")
+    else:
+        fig = plot_emlap_fourpanel(selected_lemma, grouped, perwork)
+        st.pyplot(fig)
+else:
+    st.warning("Plots require loading the full hit file (toggle it on).")
+
+# Instances table
+st.header("Instances (table)")
+
+if load_full_hits and not hits_df.empty:
+    table_df = filter_hits_for_table(
+        hits_df=hits_df,
+        show_emlap=show_emlap,
+        show_nosc=show_nosc,
+        show_cc=show_cc,
+        noscemus_emlap_ids=noscemus_emlap_ids,
+        drop_emlap_overlap_from_noscemus=drop_overlap,
     )
-    if st.button("Generate Plots"):
-        generate_plots(selected_entry.split("(")[0].strip())
+
+    if table_df.empty:
+        st.info("No rows match the current corpus filters.")
+    else:
+        # Add some helpful derived columns (safe even if missing)
+        table_df = table_df.copy()
+        table_df["work_id"] = table_df["grela_id"].astype("string").map(emlap_work_id)
+
+        # Optional: join EMLAP metadata labeldate for nicer browsing
+        md_map = emlap_metadata.set_index(emlap_metadata["no."].astype(str))["labeldate"].to_dict()
+        table_df["emlap_work"] = table_df["work_id"].map(lambda x: md_map.get(str(x)) if pd.notna(x) else None)
+
+        # Pick a sane column order (keep the rest after)
+        preferred = [
+            "corpus",
+            "grela_id",
+            "emlap_work",
+            "target_phrase",
+            "kwic_text",
+            "target_sentence_text",
+            "author",
+            "title",
+            "not_before",
+            "not_after",
+        ]
+        cols = [c for c in preferred if c in table_df.columns] + [c for c in table_df.columns if c not in preferred]
+        table_df = table_df[cols]
+
+        st.dataframe(table_df, use_container_width=True, height=450)
+
+        # download
+        csv_bytes = table_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download filtered instances as CSV",
+            data=csv_bytes,
+            file_name=f"{selected_lemma}_instances_filtered.csv",
+            mime="text/csv",
+        )
+else:
+    st.write(pd.DataFrame({"empty": []}))
