@@ -3,6 +3,9 @@
 import re
 from typing import Optional
 import duckdb
+import os
+import shutil
+import uuid
 
 
 # ---------------------------------------------------------------------------
@@ -449,26 +452,80 @@ def kwic_from_spans(
     span_idx_max: Optional[int] = None,
     max_hits: Optional[int] = None,
     out_path: Optional[str] = None,
+    # NEW (safe defaults; tune as needed):
+    batch_threshold: int = 100_000,
+    batch_size: int = 10_000,
+    tmp_dir: Optional[str] = None,
 ):
     """
     Phase 2: Take a spans table (created by create_target_spans_table) and
     build full KWIC.
 
-    Spans table is expected to have:
-      span_idx, grela_id, target_sentence_id, start_token_id, end_token_id,
-      matched_by, target_from, target_phrase
-
-    You can:
-      - provide span_idx_min & span_idx_max to process a chunk, OR
-      - leave them None and optionally use max_hits to cap total matches.
-
-    Output columns now include work metadata:
-      - author
-      - title
-      - not_before
-      - not_after
+    If out_path is provided and the spans table is large, the function will
+    automatically process spans in batches and merge them into a single Parquet
+    (no global ordering, same schema).
     """
 
+    def _q(path: str) -> str:
+        # SQL-safe single-quoted path
+        return "'" + path.replace("'", "''") + "'"
+
+    # ------------------------------------------------------------------
+    # Batched mode (only when writing to Parquet, and only in "full" mode)
+    # ------------------------------------------------------------------
+    if out_path and (span_idx_min is None and span_idx_max is None):
+        n_spans = conn.execute(f"SELECT COUNT(*) FROM {spans_table}").fetchone()[0] or 0
+        if max_hits is not None:
+            n_spans = min(n_spans, int(max_hits))
+
+        if n_spans > batch_threshold:
+            out_path = str(out_path)
+
+            # Choose a temp directory near output by default (usually faster / same FS)
+            if tmp_dir is None:
+                base = os.path.dirname(out_path) or "."
+                tmp_dir = os.path.join(base, f".tmp_kwic_{uuid.uuid4().hex}")
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            try:
+                # Write per-batch Parquets
+                for lo in range(1, n_spans + 1, batch_size):
+                    hi = min(lo + batch_size - 1, n_spans)
+                    part_path = os.path.join(tmp_dir, f"part_{lo:09d}_{hi:09d}.parquet")
+
+                    # recurse in range mode (won't re-batch)
+                    kwic_from_spans(
+                        conn,
+                        spans_table=spans_table,
+                        window=window,
+                        include_tokens=include_tokens,
+                        span_idx_min=lo,
+                        span_idx_max=hi,
+                        max_hits=None,  # range wins
+                        out_path=part_path,
+                        batch_threshold=batch_threshold,
+                        batch_size=batch_size,
+                        tmp_dir=tmp_dir,
+                    )
+
+                # Merge parts -> final parquet INSIDE DuckDB, without ORDER BY (memory-friendly)
+                glob = os.path.join(tmp_dir, "part_*.parquet")
+                conn.execute(
+                    f"""
+                    COPY (
+                      SELECT *
+                      FROM read_parquet({_q(glob)})
+                    ) TO {_q(out_path)} (FORMAT PARQUET);
+                    """
+                )
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            return None
+
+    # ------------------------------------------------------------------
+    # Non-batched execution (single chunk OR explicit span range)
+    # ------------------------------------------------------------------
     span_filter = ""
     span_params: list = []
 
@@ -481,12 +538,12 @@ def kwic_from_spans(
         span_params = []
         limit_clause = f"LIMIT {int(max_hits)}" if max_hits is not None else ""
 
+    # NOTE: removed ORDER BY in uniq_matches to avoid global sort work
     sql_core = f"""
 WITH uniq_matches AS (
   SELECT *
   FROM {spans_table}
   {span_filter}
-  ORDER BY grela_id, target_sentence_id, start_token_id
   {limit_clause}
 ),
 context AS (
@@ -553,6 +610,7 @@ target_enrich AS (
 """
 
     # ---------- heavy tail (with kwic_tokens & sentence_tokens) ----------
+    # NOTE: removed final ORDER BY in the SELECT to avoid global sorting
     sql_heavy_tail = """
 ,agg_kwic AS (
   SELECT
@@ -560,8 +618,8 @@ target_enrich AS (
     ANY_VALUE(matched_by)    AS matched_by,
     ANY_VALUE(target_from)   AS target_from,
     ANY_VALUE(target_phrase) AS target_phrase,
-    LIST(sentence_id ORDER BY ord)           AS window_sentence_ids,
-    STRING_AGG(token_text, ' ' ORDER BY ord) AS kwic_text,
+    LIST(sentence_id ORDER BY ord)            AS window_sentence_ids,
+    STRING_AGG(token_text, ' ' ORDER BY ord)  AS kwic_text,
     LIST(
       STRUCT_PACK(
         token_id := token_id,
@@ -640,7 +698,6 @@ LEFT JOIN target_sentence_tokens tstok
   ON tstok.grela_id = a.grela_id AND tstok.sentence_id = a.target_sentence_id
 LEFT JOIN works w
   ON w.grela_id = a.grela_id
-ORDER BY a.grela_id, a.target_sentence_id, a.start_token_id
 """
 
     # ---------- light tail (no kwic_tokens / sentence_tokens) ----------
@@ -651,8 +708,8 @@ ORDER BY a.grela_id, a.target_sentence_id, a.start_token_id
     ANY_VALUE(matched_by)    AS matched_by,
     ANY_VALUE(target_from)   AS target_from,
     ANY_VALUE(target_phrase) AS target_phrase,
-    LIST(sentence_id ORDER BY ord)           AS window_sentence_ids,
-    STRING_AGG(token_text, ' ' ORDER BY ord) AS kwic_text
+    LIST(sentence_id ORDER BY ord)            AS window_sentence_ids,
+    STRING_AGG(token_text, ' ' ORDER BY ord)  AS kwic_text
   FROM context
   GROUP BY grela_id, target_sentence_id, start_token_id
 ),
@@ -695,7 +752,6 @@ LEFT JOIN target_sentence_texts  tst
   ON tst.grela_id = a.grela_id AND tst.sentence_id = a.target_sentence_id
 LEFT JOIN works w
   ON w.grela_id = a.grela_id
-ORDER BY a.grela_id, a.target_sentence_id, a.start_token_id
 """
 
     sql_tail = sql_heavy_tail if include_tokens else sql_light_tail
@@ -705,9 +761,8 @@ ORDER BY a.grela_id, a.target_sentence_id, a.start_token_id
 
     if out_path:
         sql_nosemi = sql.rstrip().rstrip(";")
-        path_str = str(out_path)  # handle Path or str
-        out_q = "'" + path_str.replace("'", "''") + "'"
-        conn.execute(f"COPY ({sql_nosemi}) TO {out_q} (FORMAT PARQUET);", params)
+        path_str = str(out_path)
+        conn.execute(f"COPY ({sql_nosemi}) TO {_q(path_str)} (FORMAT PARQUET);", params)
         return None
     else:
         return conn.execute(sql, params).fetch_df()
