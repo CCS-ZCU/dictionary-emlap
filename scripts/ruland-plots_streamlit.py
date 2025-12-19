@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import fnmatch
 
+import instances_embeddings_eval as iee
+
+
 
 # ---------------------------
 # Config
@@ -411,3 +414,87 @@ if load_full_hits and not hits_df.empty:
         )
 else:
     st.write(pd.DataFrame({"empty": []}))
+
+
+# ---------------------------
+# Exploring Contextual Embeddings (optional)
+# ---------------------------
+st.header("Exploring Contextual Embeddings")
+
+with st.expander("Open: 3D projections + cross-subset similarity", expanded=False):
+    st.markdown(
+        """
+This section samples up to **100 instances per subset**, computes **KWIC target-token embeddings**
+(layer 11 of your WSD-optimised Latin BERT), and renders a **3D plot**:
+x = `date_random`, y/z = 2D projection of embeddings.
+
+It also computes an average cosine **similarity/distance** matrix by random pairing between subsets.
+"""
+    )
+
+    # Controls
+    c1, c2, c3, c4 = st.columns([1.1, 1.2, 1.1, 1.1])
+    with c1:
+        form = st.radio("Figure type", ["static", "interactive"], horizontal=True)
+    with c2:
+        projection = st.selectbox("Projection", list(iee.REDUCTIONS.keys()), index=list(iee.REDUCTIONS.keys()).index("pca10_tsne"))
+    with c3:
+        kind = st.radio("Cosine metric", ["similarity", "distance"], horizontal=True)
+    with c4:
+        n_pairs = st.number_input("Pairs per cell", min_value=10, max_value=5000, value=100, step=50)
+
+    seed = st.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1)
+
+    run = st.button("Generate embedding plot", type="primary")
+
+    if run:
+        fname = str(selected.get("instance_fname", "") or "")
+        if not fname:
+            st.error("No instance_fname for this lemma (cannot load hit file).")
+            st.stop()
+
+        # Cache-heavy step: load -> enrich -> sample -> embed
+        @st.cache_data(show_spinner=True)
+        def _compute_sample(fname: str):
+            hits = load_hits_df(fname)
+            full, full_sizes = iee.enrich_instances(hits)
+            sample, sample_sizes = iee.produce_and_enrich_samples(full)
+            return sample, full_sizes, sample_sizes
+
+        instances_sample, full_sizes, sample_sizes = _compute_sample(fname)
+
+        # Similarity matrix (light-ish; depends on n_pairs)
+        S = iee.avg_cosine_matrix_random_pairs(
+            instances_sample,
+            order=["emlap", "noscemus_alchymia", "noscemus_rest", "cc"],
+            n_pairs=int(n_pairs),
+            random_state=int(seed),
+            kind=kind,
+        )
+
+        # Plot (uses your module’s geometry and hover)
+        fig = iee.make_plot(
+            instances_sample,
+            iee.palette,
+            full_sizes,
+            sample_sizes,
+            projection=projection,
+            form=form,
+        )
+
+        st.subheader("3D projection")
+        if form == "static":
+            st.pyplot(fig, clear_figure=True)
+        else:
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader(f"Average cosine {kind} matrix (random pairing, n_pairs={int(n_pairs)})")
+        st.dataframe(S, use_container_width=True)
+
+        st.subheader("Sampled instances used")
+        st.caption("This is the sampled/enriched DataFrame (up to 100 per subset).")
+        st.dataframe(
+            instances_sample.drop(columns=["embedding"], errors="ignore"),
+            use_container_width=True,
+            height=320
+        )

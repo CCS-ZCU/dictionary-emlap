@@ -3,15 +3,13 @@ jupyter
 ipykernel
 
 pandas
-nltk
-gensim
-networkx
+streamlit
+
+transformers
+sentence_transformers
+transformers
+tensor2tensor
+tempun
+
+umap-learn
 scikit-learn
-
-matplotlib
-seaborn
-
-spacy
-unidecode
-
-sddk
