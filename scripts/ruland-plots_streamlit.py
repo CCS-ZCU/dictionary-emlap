@@ -515,15 +515,22 @@ It also computes an average cosine **similarity/distance** matrix by random pair
             st.warning("Sampling produced no instances.")
             st.stop()
 
-        order = iee.present_order(instances_sample, iee.palette)
+        # Drop subsets that ended up with zero rows after sampling
+        subset_counts = instances_sample["subsets"].value_counts()
+        keep_subsets = subset_counts[subset_counts > 0].index
 
-        S = iee.avg_cosine_matrix_random_pairs(
+        instances_sample = instances_sample[instances_sample["subsets"].isin(keep_subsets)]
+        order = [s for s in iee.present_order(instances_sample, iee.palette) if s in keep_subsets]
+        #order = iee.present_order(instances_sample, iee.palette)
+
+        S, Ps = iee.avg_cosine_matrix_random_pairs(
             instances_sample,
             order=order,
             n_pairs=int(n_pairs),
             random_state=int(seed),
             kind=kind,
         )
+
 
         fig = iee.make_plot(
             instances_sample,
@@ -543,9 +550,13 @@ It also computes an average cosine **similarity/distance** matrix by random pair
         st.subheader(f"Average cosine {kind} matrix (random pairing, n_pairs={int(n_pairs)})")
         st.dataframe(S, use_container_width=True)
 
-        st.subheader("Sampled instances used")
-        st.dataframe(
-            instances_sample.drop(columns=["embedding"], errors="ignore"),
-            use_container_width=True,
-            height=320,
-        )
+        st.subheader(f"P-values ({kind} cross vs within baseline)")
+        st.dataframe(Ps, use_container_width=True)
+
+
+        #st.subheader("Sampled instances used")
+        #st.dataframe(
+        #    instances_sample.drop(columns=["embedding"], errors="ignore"),
+        #    use_container_width=True,
+        #    height=320,
+        #)

@@ -2,11 +2,7 @@
 
 ---
 ## Authors
-* Sarah A. Lang
-* Vojtěch Kaše
-* Georgiana Hedesan
-* Petr Pavlas
-
+(anonymized)
 
 ## License
 CC-BY-SA 4.0, see attached License.md
@@ -16,8 +12,8 @@ CC-BY-SA 4.0, see attached License.md
 
 This repository hosts code in which we:
 (1) load, parse, and lemmatize entries from a TEI-XML edition of Ruland's dictionary available from [here](https://github.com/sarahalang/alchemical-dictionaries/tree/main)
-(2) detect all these entries in the [EMLAP](https://zenodo.org/records/14765511) corpus of Early Modern Latin Alchemical Prints
-(3) load these data into a web app allowing to visualize temporal distribution of the detected instances
+(2) detect all these entries in the Latin portition of [Grela](https://zenodo.org/records/18160596), with a special attention paid to instances found in [EMLAP](https://zenodo.org/records/14765511), a corpus of Early Modern Latin Alchemical Prints also included in GreLa
+(3) load these data into a [web app](https://ccs-lab.zcu.cz/ruland-plots/), which allows to visualize temporal distribution and token embeddings of the detected instances
 (4) conduct additional analyses of the data
 
 ## Getting started

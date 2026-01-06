@@ -71,7 +71,7 @@ def read_hits(fname):
         instances = pd.read_parquet(path).to_dict("records")
     except:
         instances = []
-    instances = pd.DataFrame(instances_list)
+    instances = pd.DataFrame(instances)
     return instances
 
 
@@ -176,82 +176,146 @@ REDUCTIONS = {
 }
 
 
+import numpy as np
+import pandas as pd
+
 def avg_cosine_matrix_random_pairs(
     instances,
     subset_col="subsets",
     emb_col="embedding",
     order=None,
-    n_pairs=100,
+    n_pairs=1000,
     random_state=42,
-    kind="distance",
+    kind="distance",                 # "distance" or "similarity"
+    test="welch_t",                  # "welch_t" or "mannwhitney"
+    alternative="two-sided",         # "two-sided", "less", "greater"
+    pool_within="both",              # "both" (within a + within b) or "a_only"
 ):
+    """
+    Returns:
+      S  : DataFrame of mean similarity (or distance)
+      Ps : DataFrame of p-values for cross(a,b) vs within baseline
+
+    Baseline:
+      - if pool_within="both": within(a,a) pooled with within(b,b)
+      - if pool_within="a_only": within(a,a) only
+    """
+
     if kind not in {"distance", "similarity"}:
         raise ValueError("kind must be 'distance' or 'similarity'")
+    if test not in {"welch_t", "mannwhitney"}:
+        raise ValueError("test must be 'welch_t' or 'mannwhitney'")
+    if alternative not in {"two-sided", "less", "greater"}:
+        raise ValueError("alternative must be 'two-sided', 'less', or 'greater'")
 
     rng = np.random.default_rng(random_state)
 
     if order is None:
         order = list(pd.Index(instances[subset_col].dropna().unique()).sort_values())
 
+    # --- collect normalized embeddings per subset ---
     mats = {}
     sizes = {}
-
     for s in order:
-        ser = instances.loc[instances[subset_col] == s, emb_col]
-
-        # drop missing embeddings explicitly
-        ser = ser.dropna()
-
+        ser = instances.loc[instances[subset_col] == s, emb_col].dropna()
         if len(ser) == 0:
             mats[s] = np.empty((0, 0), dtype=np.float32)
             sizes[s] = 0
             continue
-
         X = np.vstack(ser.apply(lambda v: np.asarray(v, dtype=np.float32)).to_numpy())
         X /= (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
         mats[s] = X
         sizes[s] = X.shape[0]
 
-    out = pd.DataFrame(index=order, columns=order, dtype=float)
-
-    for i, a in enumerate(order):
+    # --- sample within-subset similarities (for baselines) ---
+    within_sims = {}
+    for a in order:
         Xa = mats[a]
         na = sizes[a]
+        if na < 2:
+            within_sims[a] = np.array([], dtype=np.float64)
+            continue
+        ia = rng.integers(0, na, size=n_pairs)
+        ib = rng.integers(0, na, size=n_pairs)
+        same = (ia == ib)
+        while same.any():
+            ib[same] = rng.integers(0, na, size=int(same.sum()))
+            same = (ia == ib)
+        sims = np.einsum("ij,ij->i", Xa[ia], Xa[ib]).astype(np.float64)
+        within_sims[a] = sims
 
+    # --- output matrices ---
+    S  = pd.DataFrame(index=order, columns=order, dtype=float)
+    Ps = pd.DataFrame(index=order, columns=order, dtype=float)
+
+    # helpers for p-value
+    def _welch_p(x, y):
+        # Welch t-test; implement p-value conversion for alternative without relying on scipy version
+        import math
+        from scipy.stats import ttest_ind
+        t, p2 = ttest_ind(x, y, equal_var=False, nan_policy="omit")
+        if not np.isfinite(t) or not np.isfinite(p2):
+            return np.nan
+        if alternative == "two-sided":
+            return float(p2)
+        # t is for (mean(x) - mean(y))
+        if alternative == "less":       # mean(x) < mean(y)
+            return float(p2 / 2.0) if t < 0 else float(1.0 - p2 / 2.0)
+        else:                           # "greater": mean(x) > mean(y)
+            return float(p2 / 2.0) if t > 0 else float(1.0 - p2 / 2.0)
+
+    def _mw_p(x, y):
+        from scipy.stats import mannwhitneyu
+        # mannwhitneyu expects non-empty arrays
+        if len(x) == 0 or len(y) == 0:
+            return np.nan
+        res = mannwhitneyu(x, y, alternative=alternative)
+        return float(res.pvalue)
+
+    # --- fill matrices ---
+    for i, a in enumerate(order):
+        Xa, na = mats[a], sizes[a]
         for j, b in enumerate(order):
             if j < i:
                 continue
 
-            Xb = mats[b]
-            nb = sizes[b]
+            Xb, nb = mats[b], sizes[b]
 
+            # mean similarity/distance
             if na == 0 or nb == 0:
                 mean_sim = np.nan
-
-            elif a != b:
+                cross = np.array([], dtype=np.float64)
+            elif a == b:
+                cross = within_sims[a]
+                mean_sim = float(np.mean(cross)) if len(cross) else np.nan
+            else:
                 ia = rng.integers(0, na, size=n_pairs)
                 ib = rng.integers(0, nb, size=n_pairs)
-                sims = np.einsum("ij,ij->i", Xa[ia], Xb[ib])
-                mean_sim = float(sims.mean())
-
-            else:
-                if na < 2:
-                    mean_sim = np.nan
-                else:
-                    ia = rng.integers(0, na, size=n_pairs)
-                    ib = rng.integers(0, na, size=n_pairs)
-                    same = (ia == ib)
-                    while same.any():
-                        ib[same] = rng.integers(0, na, size=int(same.sum()))
-                        same = (ia == ib)
-                    sims = np.einsum("ij,ij->i", Xa[ia], Xa[ib])
-                    mean_sim = float(sims.mean())
+                cross = np.einsum("ij,ij->i", Xa[ia], Xb[ib]).astype(np.float64)
+                mean_sim = float(cross.mean())
 
             val = (1.0 - mean_sim) if kind == "distance" else mean_sim
-            out.loc[a, b] = val
-            out.loc[b, a] = val
+            S.loc[a, b] = val
+            S.loc[b, a] = val
 
-    return out
+            # p-values only for cross pairs
+            if a == b:
+                p = np.nan
+            else:
+                if pool_within == "both":
+                    baseline = np.concatenate([within_sims[a], within_sims[b]])
+                else:
+                    baseline = within_sims[a]
+
+                if len(cross) < 2 or len(baseline) < 2:
+                    p = np.nan
+                else:
+                    p = _welch_p(cross, baseline) if test == "welch_t" else _mw_p(cross, baseline)
+
+            Ps.loc[a, b] = p
+            Ps.loc[b, a] = p
+
+    return S, Ps
 
 def get_2d(emb, projection_factory, random_state=42):
     """
