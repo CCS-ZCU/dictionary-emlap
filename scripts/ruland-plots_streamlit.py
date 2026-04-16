@@ -195,7 +195,7 @@ def compute_emlap_distributions_from_instances(instances_enriched: pd.DataFrame,
 
 
 def plot_emlap_fourpanel(entry: str, grouped, perwork):
-    fig, axes = plt.subplots(2, 2, figsize=(30, 12), dpi=250)
+    fig, axes = plt.subplots(2, 2, figsize=(30, 12), dpi=600)
 
     ax1 = axes[0, 0]
     ax1.bar(grouped["Bidecade"], grouped["Frequency"], color="darkblue")
@@ -232,6 +232,86 @@ def plot_emlap_fourpanel(entry: str, grouped, perwork):
     plt.tight_layout()
     return fig
 
+
+def plot_emlap_fourpanel_4x1(
+    entry, grouped, perwork,
+    figsize=(16, 24),
+    dpi=300,
+    height_ratios=(0.75, 0.75, 1.15, 1.15),
+    gap_bc=0.06,
+    hspace_cd=1.05,   # only if C/D labels start to collide
+    bottom=0.12,      # keep (needed for labels)
+    hspace_ab=0.35,
+    top=0.95,
+    left=0.06,
+    right=0.995,
+    labelpad=8,
+    x_tick_pad=18,
+    title_pad=18,
+):
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+
+    # Outer grid: [A,B] block + [C,D] block, with a normal gap between blocks
+    outer = fig.add_gridspec(
+        2, 1,
+        height_ratios=[height_ratios[0] + height_ratios[1], height_ratios[2] + height_ratios[3]],
+        hspace=gap_bc
+    )
+
+    top_gs = outer[0].subgridspec(2, 1, height_ratios=height_ratios[:2], hspace=hspace_ab)
+    bot_gs = outer[1].subgridspec(2, 1, height_ratios=height_ratios[2:], hspace=hspace_cd)
+
+    ax1 = fig.add_subplot(top_gs[0])
+    ax2 = fig.add_subplot(top_gs[1])
+    ax3 = fig.add_subplot(bot_gs[0])
+    ax4 = fig.add_subplot(bot_gs[1])
+
+    fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
+
+    xb = np.arange(len(grouped["Bidecade"]))
+    xw = np.arange(len(perwork["labeldate"]))
+
+    def _style(ax):
+        ax.tick_params(axis="x", pad=x_tick_pad)
+        ax.grid(axis="y", linestyle=":", alpha=0.25)
+
+    # (A)
+    ax1.bar(xb, grouped["Frequency"], color="darkblue")
+    ax1.set_xlabel("Bidecades", fontsize=11, labelpad=labelpad)
+    ax1.set_ylabel("Absolute Frequency", fontsize=11, labelpad=labelpad)
+    ax1.set_title(f"(A) Absolute Frequency of '{entry}' by Bidecades", fontsize=13, pad=title_pad)
+    ax1.set_xticks(xb)
+    ax1.set_xticklabels(grouped["Bidecade"], rotation=90, fontsize=9)
+    _style(ax1)
+
+    # (B)
+    ax2.bar(xb, grouped["RelativeFrequency"], color="darkgreen")
+    ax2.set_xlabel("Bidecades", fontsize=11, labelpad=labelpad)
+    ax2.set_ylabel("Relative Frequency (Frequency / tokens_N)", fontsize=11, labelpad=labelpad)
+    ax2.set_title(f"(B) Relative Frequency of '{entry}' by Bidecades", fontsize=13, pad=title_pad)
+    ax2.set_xticks(xb)
+    ax2.set_xticklabels(grouped["Bidecade"], rotation=90, fontsize=9)
+    _style(ax2)
+
+    # (C)
+    ax3.bar(xw, perwork["Frequency"], color="darkblue")
+    ax3.set_xlabel("Works", fontsize=11, labelpad=labelpad)
+    ax3.set_ylabel("Absolute Frequency", fontsize=11, labelpad=labelpad)
+    ax3.set_title(f"(C) Absolute Frequency of '{entry}' by Works", fontsize=13, pad=title_pad)
+    ax3.set_xticks(xw)
+    ax3.set_xticklabels(perwork["labeldate"], rotation=90, fontsize=8)
+    _style(ax3)
+
+    # (D)
+    ax4.bar(xw, perwork["RelativeFrequency"], color="darkgreen")
+    ax4.set_xlabel("Works", fontsize=11, labelpad=labelpad)
+    ax4.set_ylabel("Relative Frequency (Frequency / tokens_N)", fontsize=11, labelpad=labelpad)
+    ax4.set_title(f"(D) Relative Frequency of '{entry}' by Works", fontsize=13, pad=title_pad)
+    ax4.set_xticks(xw)
+    ax4.set_xticklabels(perwork["labeldate"], rotation=90, fontsize=8)
+    _style(ax4)
+
+    return fig
 
 def truncate_series(s: pd.Series, n: int) -> pd.Series:
     s = s.astype("string")
@@ -351,7 +431,7 @@ if load_full_hits and not instances_enriched.empty:
     if grouped is None or perwork is None or grouped.empty:
         st.warning("No (filtered) EMLAP instances for this entry (or could not derive EMLAP work IDs).")
     else:
-        fig = plot_emlap_fourpanel(selected_lemma, grouped, perwork)
+        fig = plot_emlap_fourpanel_4x1(selected_lemma, grouped, perwork)
         st.pyplot(fig)
 else:
     st.warning("Plots require loading the hit file (toggle it on).")
