@@ -24,15 +24,26 @@ HITS_DIR = Path("../data/large_files/emlap_ruland_instances/")  # per-entry parq
 # ---------------------------
 # Cached loaders
 # ---------------------------
+
+
 @st.cache_data(show_spinner=True, ttl=24*3600)
 def load_emlap_metadata():
+    def get_short_label(row):
+        author_title = row['working_title'].split(", ")
+        author = author_title[0]
+        title = author_title[1]
+        short_title = " ".join(title.split()[:2]) + "..."
+        author_title_short = ", ".join([author, short_title])
+        short_label = f"{author_title_short} ({row['date_publication']})"
+        return short_label
+
     emlap_metadata = pd.read_csv(
         "https://raw.githubusercontent.com/CCS-ZCU/EMLAP_ETL/refs/heads/master/data/emlap_metadata.csv",
         sep=";",
     )
 
     emlap_metadata["labeldate"] = emlap_metadata.apply(
-        lambda row: f"{row['working_title']} ({row['date_publication']})",
+        lambda row: get_short_label(row),
         axis=1,
     )
 
@@ -235,19 +246,19 @@ def plot_emlap_fourpanel(entry: str, grouped, perwork):
 
 def plot_emlap_fourpanel_4x1(
     entry, grouped, perwork,
-    figsize=(16, 24),
+    figsize=(10, 15),
     dpi=300,
-    height_ratios=(0.75, 0.75, 1.15, 1.15),
-    gap_bc=0.06,
-    hspace_cd=1.05,   # only if C/D labels start to collide
-    bottom=0.12,      # keep (needed for labels)
-    hspace_ab=0.35,
-    top=0.95,
+    height_ratios=(0.75, 0.75, 1, 1),
+    hspace_ab=0.6,
+    gap_bc=0.2,
+    hspace_cd=1.8,  # only if C/D labels start to collide
+    top=0.98,
+    bottom=0.12,  # keep (needed for labels)
     left=0.06,
     right=0.995,
-    labelpad=8,
-    x_tick_pad=18,
-    title_pad=18,
+    labelpad=0,
+    x_tick_pad=0,
+    title_pad=2,
 ):
     fig = plt.figure(figsize=figsize, dpi=dpi)
 
@@ -311,6 +322,8 @@ def plot_emlap_fourpanel_4x1(
     ax4.set_xticklabels(perwork["labeldate"], rotation=90, fontsize=8)
     _style(ax4)
 
+    ax3.set_xlim(-1, len(xw) - 0)
+    ax4.set_xlim(-1, len(xw) - 0)
     return fig
 
 def truncate_series(s: pd.Series, n: int) -> pd.Series:
